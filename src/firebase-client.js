@@ -1,8 +1,10 @@
 // Firebase loader and error mapping for LightDesk.
 // The SDK (version pinned below) is loaded only when the App Store needs it.
+// The App Store uses Firestore only, and visitors never sign in: Firebase
+// Authentication is not loaded by the page. (Moderators approve apps with
+// custom claims set outside the page; see firebase/README.md.)
 // The web config is public by design; security comes from the Firestore rules
-// in firebase/, not from keeping this config secret. The App Store uses
-// Firestore only: there is no Firebase Storage.
+// in firebase/, not from keeping this config secret.
 
 export const FIREBASE_VERSION = '13.4.0';
 const BASE = `https://www.gstatic.com/firebasejs/${FIREBASE_VERSION}/`;
@@ -18,22 +20,19 @@ export const firebaseConfig = {
 
 let cached = null;
 
-// Resolves to one object with the SDK functions plus app, db and auth.
+// Resolves to one object with the SDK functions plus app and db.
 export function getFirebase() {
   if (cached) return cached;
   cached = (async () => {
-    const [appSdk, dbSdk, authSdk] = await Promise.all([
+    const [appSdk, dbSdk] = await Promise.all([
       import(BASE + 'firebase-app.js'),
       import(BASE + 'firebase-firestore.js'),
-      import(BASE + 'firebase-auth.js'),
     ]);
     const app = appSdk.initializeApp(firebaseConfig);
     return {
       ...dbSdk,
-      ...authSdk,
       app,
       db: dbSdk.getFirestore(app),
-      auth: authSdk.getAuth(app),
     };
   })();
   return cached.catch(err => {
@@ -54,7 +53,7 @@ const KNOWN = {
   'auth/too-many-requests': 'Too many attempts. Wait a few minutes and try again.',
   'auth/network-request-failed': 'Could not reach Firebase. Check your connection.',
   'auth/unauthorized-domain': 'This site is not authorized for Firebase sign-in. Add its domain in Firebase Authentication settings.',
-  'permission-denied': 'Firebase denied this request. Check that the security rules are deployed and that you have permission.',
+  'permission-denied': 'Firebase denied this request. The app may already be removed, or the request was not allowed by the security rules.',
   'unavailable': 'Firebase is unavailable right now. Try again shortly.',
   'not-found': 'That item no longer exists.',
   'resource-exhausted': 'The Firestore quota for this Firebase project has been reached.',

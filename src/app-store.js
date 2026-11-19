@@ -1,17 +1,53 @@
-// App Store logic: publishing, updating, deleting, reviews, catalog queries.
+// App Store logic: submitting, withdrawing pending apps, submitting updates,
+// reviews, reports, and catalog queries. No accounts are used.
 //
-// Everything is stored in Firestore: app metadata in apps/{appId}, and package
-// and image bytes as chunk documents (see firestore-files.js).
+// Access model (enforced by firebase/firestore.rules, not by this file):
+//   - Anyone can submit an app. Submissions start as "pending" and are unlisted:
+//     they can be read only by their random document id, never listed.
+//   - Only moderators can publish, reject, or supersede apps. Published apps are
+//     never changed or deleted by visitors.
+//   - A visitor can withdraw an app that is still "pending", but only with its id.
+//     Ids are random and are shown only to the browser that submitted the app.
+//   - Chunks can be created only before their app document exists, so a finished
+//     app's files cannot be overwritten. Chunks are removed with their app.
 //
-// Every function takes `api`, the object from getFirebase() (or a test double),
-// so the sequencing can be tested without a live project. Nothing here reports
-// success until the Firestore write has completed. If a later step fails, the
-// chunks already written in this operation are removed, and that is reported.
+// Every function takes `api`, the object from getFirebase() (or a test double), so
+// the sequencing can be tested without a live project. Nothing reports success until
+// Firestore confirms the write. If a later step fails, chunks written by this
+// operation are removed, and anything that cannot be removed is reported.
 import { sha256Hex } from './install.js';
+import { firebaseErrorMessage } from './firebase-client.js';
 import { AssetError, fileId, deleteFile, downloadFile, imageDataUrl, uploadFile, validateImage, validatePackage, LIMITS } from './firestore-files.js';
 
 export const CATEGORIES = Object.freeze(['Productivity', 'Games', 'Utilities', 'Education', 'Media', 'Developer tools', 'Other']);
 const VERSION_RE = /^[0-9A-Za-z][0-9A-Za-z.-]{0,31}$/;
+const APP_ID_RE = /^[a-z0-9]{20}$/;
+const APP_ID_CHARS = 'abcdefghijklmnopqrstuvwxyz0123456789';
+export const MAX_REVIEW_CHARS = 500;
+export const MAX_PUBLISHER_CHARS = 40;
+
+// Generates a random 20-character lowercase app id (rules require this shape).
+export function newAppId() {
+  return randomAlnum(20);
+}
+
+function randomAlnum(n) {
+  const out = [];
+  while (out.length < n) {
+    for (const b of globalThis.crypto.getRandomValues(new Uint8Array(n * 2))) {
+      if (b < 252 && out.length < n) out.push(APP_ID_CHARS[b % 36]); // 252 = 36 * 7: no modulo bias
+    }
+  }
+  return out.join('');
+}
+
+// Install ids must match install.js (lowercase, up to 64 characters). Listing keys
+// from earlier builds can contain capitals, so they are normalised here.
+export function installIdOf(app) {
+  const k = String(app.listingKey || app.id || '');
+  if (/^[a-z0-9][a-z0-9-]{0,63}$/.test(k)) return k;
+  return ('app-' + k.toLowerCase().replace(/[^a-z0-9-]/g, '')).slice(0, 64);
+}
 
 export function validateMetadata({ name, version, description = '', category }) {
   const n = String(name ?? '').trim();
@@ -24,7 +60,11 @@ export function validateMetadata({ name, version, description = '', category }) 
   return { name: n, version: v, description: d, category };
 }
 
-// Validates every file before anything is uploaded.
+export function cleanPublisherName(name) {
+  return String(name ?? '').trim().slice(0, MAX_PUBLISHER_CHARS) || 'Anonymous';
+}
+
+// Validates every file before anything is written.
 export function validateSubmission({ pkg, icon, screenshots = [] }) {
   if (!pkg?.bytes) throw new AssetError('missing', 'Choose a package (.html file).');
   const out = { pkg: validatePackage(pkg.bytes, pkg.name) };
@@ -36,14 +76,14 @@ export function validateSubmission({ pkg, icon, screenshots = [] }) {
   return out;
 }
 
-// Tracks files written by one operation so they can be removed if it fails.
+// Tracks chunks written by one operation so they can be removed if it fails.
 function tracker(api, appId) {
   const files = [];
   return {
     files,
-    async upload(uid, id, bytes, contentType, opts) {
+    async upload(id, bytes, contentType, opts) {
       try {
-        const desc = await uploadFile(api, { uid, appId, id }, bytes, contentType, opts);
+        const desc = await uploadFile(api, { appId, id }, bytes, contentType, opts);
         files.push(desc);
         return desc;
       } catch (err) {
@@ -65,158 +105,141 @@ function tracker(api, appId) {
   };
 }
 
-function requireUser(user) {
-  if (!user?.uid) throw new AssetError('auth', 'Sign in to continue.');
+function requireApi(api) {
+  if (!api?.db) throw new AssetError('setup', 'The App Store is not available.');
 }
 
-// Writes icons and screenshots for an app, returning the fields to store.
-async function uploadAssets(t, { uid, token, icon, iconValid, screenshots, screenshotsValid, onProgress, signal }) {
+// Writes icons and screenshots for a submission, returning the descriptors to store.
+async function uploadAssets(t, { token, icon, iconValid, screenshots, screenshotsValid, onProgress, signal }) {
   const fields = {};
   if (icon) {
-    fields.iconFile = await t.upload(uid, fileId({ kind: 'icon', token }), icon.bytes, iconValid.contentType, { onProgress: p => onProgress?.({ stage: 'icon', ...p }), signal });
+    fields.iconFile = await t.upload(fileId({ kind: 'icon', token }), icon.bytes, iconValid.contentType, { onProgress: p => onProgress?.({ stage: 'icon', ...p }), signal });
   }
   if (screenshots.length) {
     fields.screenshots = [];
     for (let i = 0; i < screenshots.length; i++) {
       const id = fileId({ kind: 'screenshot', index: i + 1, token });
-      fields.screenshots.push(await t.upload(uid, id, screenshots[i].bytes, screenshotsValid[i].contentType, { onProgress: p => onProgress?.({ stage: `screenshot ${i + 1}`, ...p }), signal }));
+      fields.screenshots.push(await t.upload(id, screenshots[i].bytes, screenshotsValid[i].contentType, { onProgress: p => onProgress?.({ stage: `screenshot ${i + 1}`, ...p }), signal }));
     }
   }
   return fields;
 }
 
-// Publishes a new app for review (status "pending").
-export async function publishNewApp({ api, user, metadata, pkg, icon, screenshots = [], onProgress, signal }) {
-  requireUser(user);
+// Submits an app for review. `supersedes` ({ id, listingKey }) marks an update to an
+// app already in the catalog; the moderator who approves it retires the old listing.
+export async function submitApp({ api, metadata, pkg, icon, screenshots = [], publisherName = '', supersedes = null, onProgress, signal }) {
+  requireApi(api);
   const meta = validateMetadata(metadata);
   const valid = validateSubmission({ pkg, icon, screenshots });
-  const uid = user.uid;
-  const ref = api.doc(api.collection(api.db, 'apps'));
-  const appId = ref.id;
+  const appId = newAppId();
   const token = String(Date.now());
   const t = tracker(api, appId);
-  let appWritten = false;
+  const ref = api.doc(api.db, 'apps', appId);
   try {
     const digest = await sha256Hex(pkg.bytes);
-    const pkgRes = await t.upload(uid, fileId({ kind: 'package', version: meta.version, token }), pkg.bytes, valid.pkg.contentType, { onProgress: p => onProgress?.({ stage: 'package', ...p }), signal });
-    const assets = await uploadAssets(t, { uid, token, icon, iconValid: valid.icon, screenshots, screenshotsValid: valid.screenshots, onProgress, signal });
+    const pkgFile = await t.upload(fileId({ kind: 'package', version: meta.version, token }), pkg.bytes, valid.pkg.contentType, { onProgress: p => onProgress?.({ stage: 'package', ...p }), signal });
+    const assets = await uploadAssets(t, { token, icon, iconValid: valid.icon, screenshots, screenshotsValid: valid.screenshots, onProgress, signal });
+    const listingKey = supersedes ? supersedes.listingKey || supersedes.id : appId;
     const doc = {
       ...meta,
-      packageFile: pkgRes,
+      packageFile: pkgFile,
       sha256: digest,
       size: pkg.bytes.byteLength,
       ...assets,
-      ownerUid: uid,
-      ownerName: String(user.displayName || 'Developer').slice(0, 80),
+      publisherName: cleanPublisherName(publisherName),
+      listingKey,
+      ...(supersedes ? { supersedes: supersedes.id } : {}),
       status: 'pending',
       createdAt: api.serverTimestamp(),
       updatedAt: api.serverTimestamp(),
     };
     await api.setDoc(ref, doc);
-    appWritten = true;
-    await api.setDoc(api.doc(api.db, 'apps', appId, 'versions', meta.version), versionRecord(api, uid, meta, pkgRes, digest, pkg.bytes.byteLength));
-    return { appId, version: meta.version };
+    return { appId, listingKey, version: meta.version };
   } catch (err) {
-    // Remove the chunks only if the app document no longer references them.
-    // If the document cannot be removed, it still points at these files, so keep them.
-    if (appWritten) {
-      try {
-        await api.deleteDoc(ref);
-      } catch {
-        throw wrapError(err, [], 'The app record could not be removed, so its stored files were kept. Check the App Store in Firebase.');
-      }
-    }
-    const leftovers = await t.rollback();
-    throw wrapError(err, leftovers);
-  }
-}
-
-function versionRecord(api, uid, meta, pkgRes, digest, size) {
-  return {
-    version: meta.version,
-    packageFile: pkgRes,
-    sha256: digest,
-    size,
-    ownerUid: uid,
-    createdAt: api.serverTimestamp(),
-  };
-}
-
-// Publishes a new version of an app the user owns. The app returns to "pending"
-// until a moderator approves it, so the catalog shows the approved version in
-// the meantime only if it is still published (see docs: updates are re-reviewed).
-export async function publishUpdate({ api, user, appId, existing, metadata, pkg, icon, screenshots = [], onProgress, signal }) {
-  requireUser(user);
-  if (!existing || existing.ownerUid !== user.uid) throw new AssetError('not-owner', 'You can only update apps you published.');
-  const meta = validateMetadata(metadata);
-  if (meta.version === existing.version) throw new AssetError('metadata', 'Choose a new version number for the update.');
-  const valid = validateSubmission({ pkg, icon, screenshots });
-  const token = String(Date.now());
-  const t = tracker(api, appId);
-  const ref = api.doc(api.db, 'apps', appId);
-  const oldFiles = [];
-  let appUpdated = false;
-  try {
-    const digest = await sha256Hex(pkg.bytes);
-    const pkgRes = await t.upload(user.uid, fileId({ kind: 'package', version: meta.version, token }), pkg.bytes, valid.pkg.contentType, { onProgress: p => onProgress?.({ stage: 'package', ...p }), signal });
-    const assets = await uploadAssets(t, { uid: user.uid, token, icon, iconValid: valid.icon, screenshots, screenshotsValid: valid.screenshots, onProgress, signal });
-    if (assets.iconFile && existing.iconFile) oldFiles.push(existing.iconFile);
-    if (assets.screenshots && Array.isArray(existing.screenshots)) oldFiles.push(...existing.screenshots.filter(s => s?.id));
-    await api.updateDoc(ref, {
-      ...meta,
-      packageFile: pkgRes,
-      sha256: digest,
-      size: pkg.bytes.byteLength,
-      ...assets,
-      status: 'pending',
-      updatedAt: api.serverTimestamp(),
-    });
-    appUpdated = true;
-    await api.setDoc(api.doc(api.db, 'apps', appId, 'versions', meta.version), versionRecord(api, user.uid, meta, pkgRes, digest, pkg.bytes.byteLength));
-  } catch (err) {
-    if (appUpdated) {
-      // The app now points at the new files. Keep them; the version record is the only missing part.
-      throw wrapError(err, [], 'The app was updated, but its version history record could not be written. The new files were kept.');
-    }
-    const leftovers = await t.rollback();
-    throw wrapError(err, leftovers);
-  }
-  // The new files are live. Remove the replaced ones; report anything that stays.
-  const replacedLeftovers = [];
-  for (const f of oldFiles) {
+    // If the app document was written after all, its chunks are in use: keep them.
+    let written = false;
     try {
-      await deleteFile(api, { appId, file: f });
+      written = (await api.getDoc(ref)).exists();
     } catch {
-      replacedLeftovers.push(f.id);
+      written = false;
     }
+    if (written) throw wrapError(err, [], 'The submission may have been saved; check its status in My apps before submitting again.');
+    const leftovers = await t.rollback();
+    throw wrapError(err, leftovers);
   }
-  return { version: meta.version, replacedLeftovers };
 }
 
-// Deletes an app the user owns: its versions and metadata first, then its stored files.
-export async function deleteOwnApp({ api, user, appId, existing }) {
-  requireUser(user);
-  if (!existing || existing.ownerUid !== user.uid) throw new AssetError('not-owner', 'You can only delete apps you published.');
-  const versions = await api.getDocs(api.collection(api.db, 'apps', appId, 'versions'));
-  const files = new Map();
-  const add = f => {
-    if (f?.id) files.set(f.id, f);
-  };
-  for (const v of versions.docs) add(v.data().packageFile);
-  add(existing.packageFile);
-  add(existing.iconFile);
-  for (const s of existing.screenshots || []) add(s);
-  for (const v of versions.docs) await api.deleteDoc(v.ref);
-  await api.deleteDoc(api.doc(api.db, 'apps', appId));
+// Removes a submission that is still pending. Chunks go first, so the app document
+// never points at files that are already gone when it is removed; the chunk rule
+// allows removal while the app is pending (or missing).
+export async function withdrawPending({ api, appId, existing }) {
+  requireApi(api);
+  if (!APP_ID_RE.test(appId)) throw new AssetError('bad-path', 'Invalid app identifier.');
+  if (!existing || existing.status !== 'pending') {
+    throw new AssetError('not-pending', 'Only apps waiting for review can be withdrawn. Published apps are removed by moderators.');
+  }
   const leftovers = [];
-  for (const f of files.values()) {
+  for (const f of filesOf(existing)) {
     try {
       await deleteFile(api, { appId, file: f });
     } catch {
       leftovers.push(f.id);
     }
   }
-  return { leftovers };
+  if (leftovers.length) {
+    throw new AssetError('storage', `The submission was not withdrawn because ${leftovers.length} stored file(s) could not be removed. Try again.`);
+  }
+  await api.deleteDoc(api.doc(api.db, 'apps', appId));
+  return { leftovers: [] };
+}
+
+export function filesOf(app) {
+  return [app.packageFile, app.iconFile, ...(app.screenshots || [])].filter(f => f && f.id);
+}
+
+// Reviews are create-only, one per device (the review id is the device id).
+export async function submitReview({ api, appId, reviewerId, rating, text = '', userName = '' }) {
+  requireApi(api);
+  const r = Number(rating);
+  if (!Number.isInteger(r) || r < 1 || r > 5) throw new AssetError('metadata', 'Choose a rating from 1 to 5.');
+  const body = String(text).trim();
+  if (body.length > MAX_REVIEW_CHARS) throw new AssetError('metadata', 'Reviews must be 500 characters or fewer.');
+  await api.setDoc(api.doc(api.db, 'apps', appId, 'reviews', reviewerId), {
+    rating: r,
+    text: body,
+    userName: cleanPublisherName(userName || 'Reader'),
+    createdAt: api.serverTimestamp(),
+  });
+}
+
+export async function loadReviews({ api, appId }) {
+  const snap = await api.getDocs(api.collection(api.db, 'apps', appId, 'reviews'));
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+}
+
+// Reports go to moderators. They reference only published apps (see the rules).
+export async function reportApp({ api, appId, reason = 'Reported from the App Store' }) {
+  requireApi(api);
+  await api.addDoc(api.collection(api.db, 'reports'), {
+    appId,
+    reason: String(reason).slice(0, 500),
+    createdAt: api.serverTimestamp(),
+  });
+}
+
+export async function loadCatalog({ api, category = '' }) {
+  requireApi(api);
+  const clauses = [api.where('status', '==', 'published')];
+  if (category) clauses.push(api.where('category', '==', category));
+  const snap = await api.getDocs(api.query(api.collection(api.db, 'apps'), ...clauses));
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+}
+
+// Reads one submission by its id (pending or published). Null if it no longer exists.
+export async function loadSubmission({ api, appId }) {
+  requireApi(api);
+  const snap = await api.getDoc(api.doc(api.db, 'apps', appId));
+  return snap.exists() ? { id: appId, ...snap.data() } : null;
 }
 
 // Reads a listing's package chunks (used by the installer instead of a URL download).
@@ -229,41 +252,9 @@ export function loadImage({ api, appId, file, signal }) {
   return imageDataUrl(api, { appId, file, signal });
 }
 
-export async function submitReview({ api, user, appId, rating, text = '', userName = '' }) {
-  requireUser(user);
-  const r = Number(rating);
-  if (!Number.isInteger(r) || r < 1 || r > 5) throw new AssetError('metadata', 'Choose a rating from 1 to 5.');
-  const body = String(text).trim();
-  if (body.length > 500) throw new AssetError('metadata', 'Reviews must be 500 characters or fewer.');
-  await api.setDoc(api.doc(api.db, 'apps', appId, 'reviews', user.uid), {
-    rating: r,
-    text: body,
-    userName: String(userName || 'Reader').slice(0, 80),
-    updatedAt: api.serverTimestamp(),
-  });
-}
-
-export async function loadReviews({ api, appId }) {
-  const snap = await api.getDocs(api.collection(api.db, 'apps', appId, 'reviews'));
-  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-}
-
-export async function loadCatalog({ api, category = '' }) {
-  const clauses = [api.where('status', '==', 'published')];
-  if (category) clauses.push(api.where('category', '==', category));
-  const snap = await api.getDocs(api.query(api.collection(api.db, 'apps'), ...clauses));
-  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-}
-
-export async function loadMyApps({ api, user }) {
-  requireUser(user);
-  const snap = await api.getDocs(api.query(api.collection(api.db, 'apps'), api.where('ownerUid', '==', user.uid)));
-  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-}
-
 // Adds the step name to an error and lists files that could not be removed.
 function wrapError(err, leftovers, note = '') {
-  const e = err instanceof AssetError ? err : new AssetError('publish', err?.message || 'Publishing failed.');
+  const e = err instanceof AssetError ? err : new AssetError('publish', err?.code ? firebaseErrorMessage(err) : err?.message || 'Publishing failed.');
   if (note) e.message = `${e.message} ${note}`;
   if (leftovers?.length) e.message += ` ${leftovers.length} stored file(s) could not be removed and remain in Firestore: ${leftovers.join(', ')}.`;
   e.leftovers = leftovers || [];

@@ -34,7 +34,6 @@ function storeView(){return Store.markup()}
 function storeAction(b){Store.action(b)}
 function loadStore(){return Store.load()}
 function renderStoreCards(f){Store.renderCards(f)}
-function subscribeAuth(){return Store.subscribe()}
 function bindStore(){}
 function publishApp(form){return Store.publish(form)}
 const wallPresets={aurora:'linear-gradient(135deg,#203543,#405967 55%,#263c43)',dusk:'linear-gradient(135deg,#362536,#754a59 55%,#48384d)',ocean:'linear-gradient(135deg,#142f43,#236686 55%,#193e4a)',plain:'linear-gradient(135deg,#444c51,#697176)'};
@@ -45,7 +44,7 @@ function appList(){return[...APPS,...state.installed.map(a=>({id:'custom:'+a.id,
 function tile(a){return`<button class="launch-card" data-open="${esc(a.id)}"><span class="glyph">${icon(a.icon)}</span><span>${esc(a.name)}</span></button>`}
 function renderChrome(){const apps=appList();$('#brandIcon').innerHTML=icon('home');$('#startButton').innerHTML=icon('home');$('#taskSettings').innerHTML=icon('settings');$('#mobileBack').innerHTML=icon('back');$('#mobileHomeButton').innerHTML=icon('home');$('#mobileRecent').innerHTML=icon('recent');$('#desktopIcons').innerHTML=apps.map(a=>`<button class="desktop-icon" data-open="${esc(a.id)}"><span class="glyph">${icon(a.icon)}</span><span>${esc(a.name)}</span></button>`).join('');$('#startGrid').innerHTML=apps.map(tile).join('');$('#mobileApps').innerHTML=apps.map(tile).join('');appearance();renderTasks();clock()}
 function appById(id){return id.startsWith('custom:')?state.installed.find(a=>'custom:'+a.id===id):APPS.find(a=>a.id===id)}
-function openApp(id){const app=appById(id);if(!app)return;if(wm.has(id)){wm.restore(id);return}const html=runtime.safely('app:'+id+':view',()=>appView(id),`<div class="status-error">${esc(app.name)} could not start. Other apps are unaffected.</div>`);const entry=runtime.safely('app:'+id+':open',()=>wm.open(id,app,{html,position:deviceMode()!=='mobile'?state.positions[id]:null}));if(!entry)return;runtime.safely('app:'+id+':init',()=>{if(id==='browser')renderBrowser();if(id==='notepad')renderNotes();if(id==='files')renderFiles();if(id==='store'){bindStore();runtime.attach(loadStore(),'app:store:load');runtime.attach(subscribeAuth(),'app:store:auth')}})}
+function openApp(id){const app=appById(id);if(!app)return;if(wm.has(id)){wm.restore(id);return}const html=runtime.safely('app:'+id+':view',()=>appView(id),`<div class="status-error">${esc(app.name)} could not start. Other apps are unaffected.</div>`);const entry=runtime.safely('app:'+id+':open',()=>wm.open(id,app,{html,position:deviceMode()!=='mobile'?state.positions[id]:null}));if(!entry)return;runtime.safely('app:'+id+':init',()=>{if(id==='browser')renderBrowser();if(id==='notepad')renderNotes();if(id==='files')renderFiles();if(id==='store'){bindStore();runtime.attach(loadStore(),'app:store:load')}})}
 function focus(id){wm.focus(id)}
 function closeWindow(id){wm.close(id)}
 function minimize(id){wm.minimize(id)}
