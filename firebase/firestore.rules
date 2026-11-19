@@ -1,0 +1,196 @@
+rules_version = '2';
+
+// LightDesk App Store rules. Firestore is the only backend: there is no Firebase Storage.
+//
+// apps/{appId}                                   app metadata
+// apps/{appId}/versions/{version}                version history (owner / moderator)
+// apps/{appId}/reviews/{uid}                     one review per user
+// apps/{appId}/files/{fileId}/chunks/{0000}      base64 chunks of packages, icons, screenshots
+// reports/{reportId}                             abuse reports (moderators read)
+//
+// - Anyone can read published apps and their file chunks. Pending and rejected apps
+//   (and their chunks) are readable only by their owner and by moderators.
+// - Signed-in users can submit apps, but only as "pending". They cannot publish their own app.
+// - Owners can upload a new version (it returns to "pending") or edit the description.
+//   They cannot change status or owner.
+// - Moderators (custom claim moderator == true, set with the Admin SDK) can change status.
+// - Chunks are create-only (no overwrites), at most 300,000 characters each.
+// Limitations: rules cannot see decoded bytes or add up chunk sizes. The client checks
+// file contents and totals; installs still verify size, SHA-256 and the HTML check on the device.
+// Client-side checks are never the security boundary; these rules are.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isModerator() {
+      return signedIn() && request.auth.token.moderator == true;
+    }
+
+    function isOwner() {
+      return signedIn() && resource.data.ownerUid == request.auth.uid;
+    }
+
+    function appPath(appId) {
+      return /databases/$(database)/documents/apps/$(appId);
+    }
+
+    function appIsPublished(appId) {
+      return get(appPath(appId)).data.status == 'published';
+    }
+
+    function ownsApp(appId) {
+      return signedIn() && get(appPath(appId)).data.ownerUid == request.auth.uid;
+    }
+
+    // { id, chunks, size, contentType } descriptor of a stored file.
+    function validFile(f, maxChunks, maxSize) {
+      return f is map
+        && f.keys().hasOnly(['id', 'chunks', 'size', 'contentType'])
+        && f.id is string && f.id.size() > 0 && f.id.size() <= 80
+        && f.chunks is int && f.chunks >= 1 && f.chunks <= maxChunks
+        && f.size is int && f.size > 0 && f.size <= maxSize
+        && f.contentType is string && f.contentType.size() <= 40;
+    }
+
+    function validScreenshots(list) {
+      return list is list && list.size() <= 5
+        && (list.size() == 0 || validFile(list[0], 16, 2097152))
+        && (list.size() < 2 || validFile(list[1], 16, 2097152))
+        && (list.size() < 3 || validFile(list[2], 16, 2097152))
+        && (list.size() < 4 || validFile(list[3], 16, 2097152))
+        && (list.size() < 5 || validFile(list[4], 16, 2097152));
+    }
+
+    // Fields shared by a new submission and a new version.
+    function validContent(d) {
+      return d.name is string && d.name.size() > 0 && d.name.size() <= 48
+        && d.version is string && d.version.matches('^[0-9A-Za-z][0-9A-Za-z.-]{0,31}$')
+        && d.description is string && d.description.size() <= 500
+        && d.category in ['Productivity', 'Games', 'Utilities', 'Education', 'Media', 'Developer tools', 'Other']
+        && validFile(d.packageFile, 8, 307200)
+        && d.sha256 is string && d.sha256.matches('^[a-f0-9]{64}$')
+        && d.size is int && d.size > 0 && d.size <= 307200
+        && (!('iconFile' in d) || validFile(d.iconFile, 16, 262144))
+        && (!('screenshots' in d) || validScreenshots(d.screenshots));
+    }
+
+    function contentKeys() {
+      return ['name', 'description', 'version', 'category', 'packageFile', 'sha256', 'size',
+              'iconFile', 'screenshots', 'ownerUid', 'ownerName', 'status', 'createdAt', 'updatedAt'];
+    }
+
+    function validSubmission() {
+      let d = request.resource.data;
+      return d.keys().hasOnly(contentKeys())
+        && validContent(d)
+        && d.ownerUid == request.auth.uid
+        && d.status == 'pending'
+        && d.ownerName is string && d.ownerName.size() <= 80
+        && d.createdAt == request.time
+        && d.updatedAt == request.time;
+    }
+
+    // Owner uploads a new version: back to "pending", owner and creation time unchanged.
+    function validOwnerUpdate() {
+      let d = request.resource.data;
+      return d.keys().hasOnly(contentKeys())
+        && validContent(d)
+        && d.ownerUid == resource.data.ownerUid
+        && d.ownerName == resource.data.ownerName
+        && d.createdAt == resource.data.createdAt
+        && d.status == 'pending'
+        && d.updatedAt == request.time;
+    }
+
+    // Owner edits only the description.
+    function validDescriptionEdit() {
+      let d = request.resource.data;
+      return d.ownerUid == resource.data.ownerUid
+        && d.status == resource.data.status
+        && d.diff(resource.data).affectedKeys().hasOnly(['description', 'updatedAt'])
+        && d.description is string && d.description.size() <= 500;
+    }
+
+    match /apps/{appId} {
+      allow read: if resource.data.status == 'published'
+                  || isOwner()
+                  || isModerator();
+
+      allow create: if validSubmission();
+
+      allow update: if isModerator()
+                    && request.resource.data.ownerUid == resource.data.ownerUid
+                    && request.resource.data.status in ['pending', 'published', 'rejected']
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                         .hasOnly(['status', 'updatedAt'])
+                    || isOwner() && (validOwnerUpdate() || validDescriptionEdit());
+
+      allow delete: if isOwner() || isModerator();
+
+      match /versions/{version} {
+        allow read: if ownsApp(appId) || isModerator();
+        allow create: if ownsApp(appId)
+                      && request.resource.data.keys().hasOnly(['version', 'packageFile', 'sha256', 'size', 'ownerUid', 'createdAt'])
+                      && request.resource.data.ownerUid == request.auth.uid
+                      && validFile(request.resource.data.packageFile, 8, 307200)
+                      && request.resource.data.sha256.matches('^[a-f0-9]{64}$')
+                      && request.resource.data.createdAt == request.time;
+        allow delete: if ownsApp(appId) || isModerator();
+      }
+
+      match /reviews/{reviewerUid} {
+        allow read: if appIsPublished(appId) || ownsApp(appId) || isModerator();
+        allow create, update: if signedIn()
+                              && reviewerUid == request.auth.uid
+                              && appIsPublished(appId)
+                              && request.resource.data.keys().hasOnly(['rating', 'text', 'userName', 'updatedAt'])
+                              && request.resource.data.rating is int
+                              && request.resource.data.rating >= 1 && request.resource.data.rating <= 5
+                              && request.resource.data.text is string && request.resource.data.text.size() <= 500
+                              && request.resource.data.userName is string && request.resource.data.userName.size() <= 80
+                              && request.resource.data.updatedAt == request.time;
+        allow delete: if signedIn() && reviewerUid == request.auth.uid || isModerator();
+      }
+
+      // Package, icon and screenshot bytes as base64 chunks.
+      match /files/{fileId}/chunks/{chunkId} {
+        // The owner always; anyone once the app is published.
+        allow read: if signedIn() && resource.data.ownerUid == request.auth.uid
+                    || appIsPublished(appId)
+                    || isModerator();
+
+        // Create only. Until the app document exists the app id is known only to its
+        // uploader (a random id); afterwards only the app's owner may add chunks.
+        allow create: if signedIn()
+                      && fileId.matches('^(pkg-[0-9A-Za-z][0-9A-Za-z.-]{0,31}-[0-9]{10,16}|icon-[0-9]{10,16}|shot-[1-5]-[0-9]{10,16})$')
+                      && chunkId.matches('^[0-9]{4}$')
+                      && request.resource.data.keys().hasOnly(['i', 'data', 'ownerUid'])
+                      && request.resource.data.ownerUid == request.auth.uid
+                      && request.resource.data.i is int
+                      && request.resource.data.i >= 0 && request.resource.data.i < 16
+                      && request.resource.data.data is string
+                      && request.resource.data.data.size() > 0
+                      && request.resource.data.data.size() <= 300000
+                      && (!exists(appPath(appId)) || ownsApp(appId));
+        allow delete: if signedIn() && resource.data.ownerUid == request.auth.uid || isModerator();
+      }
+    }
+
+    match /reports/{reportId} {
+      allow create: if signedIn()
+                    && request.resource.data.keys().hasOnly(['appId', 'reason', 'reporterUid', 'createdAt'])
+                    && request.resource.data.reporterUid == request.auth.uid
+                    && request.resource.data.appId is string
+                    && request.resource.data.reason is string
+                    && request.resource.data.reason.size() <= 500
+                    && request.resource.data.createdAt == request.time;
+      allow read, update, delete: if isModerator();
+    }
+
+    // Everything else is closed.
+  }
+}

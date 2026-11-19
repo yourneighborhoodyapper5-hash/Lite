@@ -1,0 +1,221 @@
+// File service for the LightDesk App Store, backed by Firestore only.
+//
+// Firebase Storage is not used. Package HTML and images are stored as
+// base64 text in "chunk" documents so that each document stays well under
+// Firestore's 1 MiB limit:
+//
+//   apps/{appId}/files/{fileId}/chunks/{0000}  ->  { i, data, ownerUid }
+//
+// The app document (and each version record) holds a small descriptor
+// { id, chunks, size, contentType } that says which chunks make up a file.
+//
+// Responsibilities:
+//   - validate what is uploaded (by file contents, not only by name)
+//   - split files into chunks, write them with REAL progress, and support cancel
+//   - read chunks back (with progress) and rebuild the original bytes
+//   - delete chunks, treating "already gone" as a non-error
+//
+// Nothing here reports success before Firestore confirms the write.
+// Rules that enforce the same limits server-side live in firebase/firestore.rules.
+// Validation here is for good user feedback only; it is not a security boundary.
+import { decodePackage, InstallError, MAX_PACKAGE_BYTES } from './install.js';
+import { firebaseErrorMessage } from './firebase-client.js';
+
+export const LIMITS = Object.freeze({
+  package: MAX_PACKAGE_BYTES,        // 300 KB of HTML
+  icon: 256 * 1024,                   // 256 KB
+  screenshot: 2 * 1024 * 1024,        // 2 MB
+  maxScreenshots: 5,
+});
+
+// Raw bytes per chunk. Base64 makes it about 4/3 larger (~253 KB), far below
+// the 1 MiB document limit. The Firestore rules cap a chunk at 300,000 characters.
+export const CHUNK_BYTES = 190000;
+export const MAX_CHUNKS = 16; // 2 MB screenshot = 12 chunks
+
+export class AssetError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = 'AssetError';
+    this.code = code;
+  }
+}
+
+const PNG = [0x89, 0x50, 0x4e, 0x47];
+const JPEG = [0xff, 0xd8, 0xff];
+
+function startsWith(bytes, sig, offset = 0) {
+  if (bytes.length < offset + sig.length) return false;
+  return sig.every((b, i) => bytes[offset + i] === b);
+}
+
+// Returns 'png' | 'jpg' | 'webp' from the file's leading bytes, or null.
+export function sniffImage(bytes) {
+  if (startsWith(bytes, PNG)) return 'png';
+  if (startsWith(bytes, JPEG)) return 'jpg';
+  // WebP: "RIFF" .... "WEBP"
+  if (startsWith(bytes, [0x52, 0x49, 0x46, 0x46]) && startsWith(bytes, [0x57, 0x45, 0x42, 0x50], 8)) return 'webp';
+  return null;
+}
+
+const CONTENT_TYPE = { png: 'image/png', jpg: 'image/jpeg', webp: 'image/webp' };
+const EXT_ALIAS = { jpeg: 'jpg' };
+const kb = n => `${Math.round(n / 1024)} KB`;
+
+// kind: 'icon' | 'screenshot'. Returns { ext, contentType }.
+export function validateImage(kind, bytes, fileName = '') {
+  const max = LIMITS[kind];
+  if (!max) throw new AssetError('bad-kind', 'Unknown image type.');
+  if (!bytes || bytes.byteLength === 0) throw new AssetError('empty', 'The image file is empty.');
+  if (bytes.byteLength > max) {
+    throw new AssetError('too-large', `${kind === 'icon' ? 'The icon' : 'A screenshot'} must be ${kb(max)} or smaller (this file is ${kb(bytes.byteLength)}).`);
+  }
+  const ext = sniffImage(bytes);
+  if (!ext) throw new AssetError('not-image', 'Use a PNG, JPEG, or WebP image.');
+  const declared = EXT_ALIAS[(fileName.split('.').pop() || '').toLowerCase()] || (fileName.split('.').pop() || '').toLowerCase();
+  if (fileName && declared !== ext) {
+    throw new AssetError('mismatch', 'The file extension does not match the image contents.');
+  }
+  return { ext, contentType: CONTENT_TYPE[ext] };
+}
+
+export function validatePackage(bytes, fileName = '') {
+  if (!bytes || bytes.byteLength === 0) throw new AssetError('empty', 'The package file is empty.');
+  if (bytes.byteLength > LIMITS.package) {
+    throw new AssetError('too-large', `The package must be ${kb(LIMITS.package)} or smaller (this file is ${kb(bytes.byteLength)}).`);
+  }
+  if (fileName && !/\.html?$/i.test(fileName)) throw new AssetError('not-html', 'The package must be an .html file.');
+  try {
+    decodePackage(bytes);
+  } catch (err) {
+    throw new AssetError('invalid-package', err.message);
+  }
+  return { contentType: 'text/html' };
+}
+
+const ID_RE = /^[A-Za-z0-9_-]{6,128}$/;
+const VERSION_RE = /^[0-9A-Za-z][0-9A-Za-z.-]{0,31}$/;
+
+// File ids (document ids under apps/{appId}/files). The token is a timestamp,
+// so a new upload never collides with an existing file (the rules do not
+// allow overwrites).
+export function fileId({ kind, version, index, token }) {
+  if (!/^[0-9]{10,16}$/.test(String(token))) throw new AssetError('bad-path', 'Invalid upload token.');
+  if (kind === 'package') {
+    if (!VERSION_RE.test(version)) throw new AssetError('bad-path', 'Invalid version.');
+    return `pkg-${version}-${token}`;
+  }
+  if (kind === 'icon') return `icon-${token}`;
+  if (kind === 'screenshot') {
+    if (!Number.isInteger(index) || index < 1 || index > LIMITS.maxScreenshots) throw new AssetError('bad-path', 'Invalid screenshot number.');
+    return `shot-${index}-${token}`;
+  }
+  throw new AssetError('bad-kind', 'Unknown asset kind.');
+}
+
+const chunkKey = i => String(i).padStart(4, '0');
+const chunkRef = (api, appId, id, i) => api.doc(api.db, 'apps', appId, 'files', id, 'chunks', chunkKey(i));
+
+export function toBase64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return globalThis.btoa(s);
+}
+
+export function fromBase64(text) {
+  const s = globalThis.atob(text);
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
+}
+
+// Writes the bytes as chunk documents and resolves with the descriptor
+// { id, chunks, size, contentType } only after every chunk is written.
+// onProgress receives real byte counts. signal cancels between chunks.
+// If it fails part-way, the error carries `partial` (what was already
+// written) so the caller can remove it.
+export async function uploadFile(api, { uid, appId, id }, bytes, contentType, { onProgress, signal } = {}) {
+  if (!ID_RE.test(uid) || !ID_RE.test(appId)) throw new AssetError('bad-path', 'Invalid owner or app identifier.');
+  const total = bytes.byteLength;
+  const chunks = Math.ceil(total / CHUNK_BYTES);
+  if (chunks < 1 || chunks > MAX_CHUNKS) throw new AssetError('too-large', 'That file is too large to store.');
+  let written = 0;
+  try {
+    for (let i = 0; i < chunks; i++) {
+      if (signal?.aborted) throw new AssetError('cancelled', 'The upload was cancelled.');
+      const end = Math.min(total, (i + 1) * CHUNK_BYTES);
+      await api.setDoc(chunkRef(api, appId, id, i), { i, data: toBase64(bytes.subarray(i * CHUNK_BYTES, end)), ownerUid: uid });
+      written = i + 1;
+      onProgress?.({ bytesTransferred: end, totalBytes: total });
+    }
+  } catch (err) {
+    const e = err instanceof AssetError ? err : storageError(err);
+    // A write may have landed even if it reported failure, so include the next chunk.
+    e.partial = { id, chunks: Math.min(chunks, written + 1) };
+    throw e;
+  }
+  return { id, chunks, size: total, contentType };
+}
+
+// Reads every chunk of a file and returns the original bytes.
+// Throws InstallError for problems the installer shows to the user, and an
+// error named "AbortError" when cancelled.
+export async function downloadFile(api, { appId, file, maxBytes = MAX_PACKAGE_BYTES, expectedSize = 0, onProgress, signal }) {
+  if (!file || typeof file.id !== 'string' || !Number.isInteger(file.chunks) || file.chunks < 1 || file.chunks > MAX_CHUNKS) {
+    throw new InstallError('invalid-record', 'This listing has an invalid package reference.');
+  }
+  const total = expectedSize || file.size || 0;
+  const parts = [];
+  let loaded = 0;
+  for (let i = 0; i < file.chunks; i++) {
+    if (signal?.aborted) throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
+    let snap;
+    try {
+      snap = await api.getDoc(chunkRef(api, appId, file.id, i));
+    } catch (err) {
+      throw new InstallError('network', `${firebaseErrorMessage(err)} Nothing was installed.`);
+    }
+    if (!snap.exists()) throw new InstallError('missing-chunk', 'The package data is incomplete on the server. Nothing was installed.');
+    let bytes;
+    try {
+      bytes = fromBase64(String(snap.data().data || ''));
+    } catch {
+      throw new InstallError('corrupt', 'The package data on the server is corrupt. Nothing was installed.');
+    }
+    loaded += bytes.byteLength;
+    if (loaded > maxBytes) throw new InstallError('too-large', 'The package is larger than the allowed size. Nothing was installed.');
+    parts.push(bytes);
+    onProgress?.({ loaded, total });
+  }
+  const out = new Uint8Array(loaded);
+  let offset = 0;
+  for (const p of parts) {
+    out.set(p, offset);
+    offset += p.byteLength;
+  }
+  return out;
+}
+
+// Reads an image file and returns a data: URL. The type comes from the
+// bytes (sniffImage), never from the stored text.
+export async function imageDataUrl(api, { appId, file, signal }) {
+  const bytes = await downloadFile(api, { appId, file, maxBytes: LIMITS.screenshot, signal });
+  const ext = sniffImage(bytes);
+  if (!ext) throw new AssetError('not-image', 'The stored image is not a PNG, JPEG, or WebP file.');
+  return `data:${CONTENT_TYPE[ext]};base64,${toBase64(bytes)}`;
+}
+
+// Deletes every chunk of a file. A chunk that is already gone is not an error.
+export async function deleteFile(api, { appId, file }) {
+  if (!file?.id) return false;
+  try {
+    for (let i = 0; i < (file.chunks || 0); i++) await api.deleteDoc(chunkRef(api, appId, file.id, i));
+    return true;
+  } catch (err) {
+    throw storageError(err);
+  }
+}
+
+function storageError(err) {
+  return new AssetError('storage', firebaseErrorMessage(err));
+}

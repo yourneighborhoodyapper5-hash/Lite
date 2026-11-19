@@ -13,6 +13,41 @@
 :root[data-mode=mobile] .desktop{inset:0;background:#16253038}:root[data-mode=mobile] .desktop-brand,:root[data-mode=mobile] .desktop-icons,:root[data-mode=mobile] .taskbar,:root[data-mode=mobile] .start-menu{display:none!important}:root[data-mode=mobile] .mobile-status{position:absolute;z-index:4;top:0;left:0;right:0;height:38px;padding:0 17px;display:flex;align-items:center;justify-content:space-between;background:#11182040;color:white;font-size:12px;text-shadow:0 1px 3px #000}:root[data-mode=mobile] .mobile-home{position:absolute;inset:38px 0 64px;display:block;overflow:auto;padding:19px;color:white}:root[data-mode=mobile] .mobile-home h1{font-size:26px;margin:10px 0 3px}:root[data-mode=mobile] .mobile-home .app-grid{grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:18px}:root[data-mode=mobile] .mobile-home .launch-card{min-height:80px;padding:5px 2px;color:white;font-size:11px}:root[data-mode=mobile] .mobile-home .glyph{width:47px;height:47px;border-radius:12px;background:#ffffff2a;color:white;border-color:#ffffff45}:root[data-mode=mobile] .mobile-nav{position:absolute;z-index:250;left:0;right:0;bottom:0;height:64px;padding-bottom:env(safe-area-inset-bottom);display:flex;justify-content:space-around;align-items:center;background:var(--task);border-top:1px solid #ffffff25;color:var(--text)}:root[data-mode=mobile] .mobile-nav button{height:50px;min-width:58px}:root[data-mode=mobile] .window-layer{inset:38px 0 64px;z-index:50}:root[data-mode=mobile] .window{inset:0!important;left:0!important;top:0!important;right:0!important;bottom:0!important;width:100%!important;height:100%!important;min-width:0;min-height:0;resize:none;border:0;border-radius:0;box-shadow:none;animation:none}:root[data-mode=mobile] .window-header{height:46px}:root[data-mode=mobile] .window-controls button:not(.close){display:none}:root[data-mode=mobile] .window-content{padding:10px}:root[data-mode=mobile] .notes-layout{grid-template-columns:100px 1fr}:root[data-mode=mobile] .window.maximized{inset:0!important}
 /* Boot firmware overlay */
 .boot-cover{position:absolute;z-index:2000;inset:0;display:grid;place-items:center;background:#080d12;color:#e4edf4;font-family:ui-monospace,Consolas,monospace}.boot-panel{width:min(540px,90vw);padding:30px}.boot-logo{font:700 28px "Segoe UI",sans-serif;letter-spacing:.03em;margin-bottom:18px}.boot-track{height:8px;background:#252c32;border:1px solid #44505a;margin:18px 0 8px}.boot-fill{height:100%;width:0;background:#70c8ed}.bios{position:absolute;inset:0;background:#0c1621;color:#c5d5e7;padding:clamp(18px,5vw,55px);font:14px/1.6 ui-monospace,Consolas,monospace}.bios h1{font-size:22px;color:#fff}.bios-box{max-width:700px;border:1px solid #59718b;padding:15px;margin:18px 0}.bios button{padding:9px 14px;background:#284565;color:white;border:1px solid #8ba8c2}.hidden{display:none!important}@media(max-width:560px){.window-content{padding:9px}.notes-layout{grid-template-columns:92px 1fr}.file-grid{grid-template-columns:1fr 1fr}.browser-bar{flex-wrap:wrap}.browser-bar input{min-width:60%}}@media(prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+
+/* ---- Browser, store and install additions (v5) ---- */
+.browser-root{display:flex;flex-direction:column;height:100%;min-height:0}
+.browser-tabs{display:flex;align-items:center;gap:4px;padding:6px 8px 0;overflow-x:auto;border-bottom:1px solid var(--line)}
+.browser-tab{display:flex;align-items:center;max-width:200px;border:1px solid var(--line);border-bottom:0;border-radius:6px 6px 0 0;background:transparent}
+.browser-tab.active{background:var(--panel);font-weight:600}
+.browser-tab-title{border:0;background:transparent;color:inherit;padding:6px 8px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer;font:inherit;font-size:12px}
+.browser-tab-close,.browser-new{border:0;background:transparent;color:inherit;cursor:pointer;padding:4px 7px;font-size:14px;border-radius:4px}
+.browser-tab-close:hover,.browser-new:hover{background:#8882}
+.browser-bar{display:flex;gap:6px;align-items:center;padding:8px;border-bottom:1px solid var(--line)}
+.browser-bar .field{flex:1;min-width:0}
+.button.icon-only{min-width:34px;padding:6px 8px}
+.button.icon-only:disabled{opacity:.45;cursor:default}
+.browser-content{flex:1;min-height:0;display:flex;flex-direction:column;overflow:auto}
+.browser-content .browser-frame{flex:1;width:100%;min-height:320px;border:0;background:#fff}
+.browser-loading{padding:6px 10px;font-size:12px;color:var(--muted)}
+.browser-hint{padding:6px 10px;font-size:11px}
+.browser-start,.browser-error{padding:16px;max-width:720px}
+.browser-links{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+.browser-link{border:1px solid var(--line);background:transparent;color:inherit;border-radius:6px;padding:6px 10px;cursor:pointer;font:inherit;font-size:13px}
+.browser-error .row{margin-top:10px}
+.store-account{margin:10px 0}
+.store-account .store-form{margin:0}
+.store-grid+.empty,.store-grid .empty{grid-column:1/-1}
+@media (prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+/* ---- App Store: tools, details, reviews, icons (v6) ---- */
+.store-tools{display:flex;gap:8px;margin:8px 0}
+.store-tools .field{flex:1;min-width:0}
+.store-icon{width:48px;height:48px;border-radius:10px;object-fit:cover;background:#8881}
+.store-icon.big{width:72px;height:72px}
+.store-shot{height:120px;border-radius:6px;background:#8881;max-width:100%;object-fit:contain}
+.store-detail{border:1px solid var(--line);border-radius:8px;padding:12px;margin:8px 0}
+.review{border-top:1px solid var(--line);padding:6px 0}
+.review p{margin:4px 0}
+.hidden{display:none!important}
 </style>
 </head>
 <body><div class="shell" id="shell">

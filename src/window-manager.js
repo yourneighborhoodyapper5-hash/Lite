@@ -1,9 +1,23 @@
-// Window manager: creates, focuses, minimizes, maximizes, drags and closes
-// application windows. It owns window DOM and z-order. Process lifecycle is
-// delegated to ProcessManager.
+// Window manager: creates, focuses, minimizes, maximizes, drags, clamps and
+// closes app windows. Owns window DOM and z-order. Process lifecycle goes
+// through ProcessManager.
+//
+// A window is suspended whenever it is not visible: minimized on desktop, or
+// behind the single visible window on a phone. Its process is suspended then
+// and resumed when it is shown again.
+//
+// Window coordinates are relative to #windowLayer, which covers the desktop
+// minus the taskbar. Its clientWidth/clientHeight is the usable work area.
 import { Scope } from './runtime.js';
 
-const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+// Must match the CSS minimums for .window (min-width / min-height).
+const MIN_W = 290;
+const MIN_H = 220;
+
+const esc = s =>
+  String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const finite = v => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 
 export class WindowManager {
   #layer;
@@ -13,7 +27,7 @@ export class WindowManager {
   #onChange;
   #onMobileHome;
   #onMoved;
-  #windows = new Map(); // id -> { el, app, proc }
+  #windows = new Map(); // id -> { el, app, proc, z, drag }
   #z = 10;
   #active = null;
   #mobile = null;
@@ -36,7 +50,7 @@ export class WindowManager {
   entries() { return this.#windows.entries(); }
   values() { return this.#windows.values(); }
 
-  // Opens a window for app. If it is already open, focuses it instead.
+  // Opens a window for app, or focuses the existing one.
   open(id, app, { html = '', position = null } = {}) {
     if (this.#windows.has(id)) {
       this.focus(id);
@@ -44,7 +58,7 @@ export class WindowManager {
     }
     const mobile = this.#isMobile();
     if (mobile) {
-      for (const w of this.#windows.values()) w.el.classList.add('hidden');
+      for (const [key, w] of this.#windows) this.#hide(key, w);
       this.#mobile = id;
       this.#onMobileHome(false);
     }
@@ -54,12 +68,6 @@ export class WindowManager {
     el.dataset.id = id;
     el.setAttribute('role', 'dialog');
     el.setAttribute('aria-label', app.name);
-    if (position && !mobile) {
-      el.style.left = position.x + 'px';
-      el.style.top = position.y + 'px';
-      if (position.w) el.style.width = position.w + 'px';
-      if (position.h) el.style.height = position.h + 'px';
-    }
     el.innerHTML =
       `<header class="window-header"><div class="window-title">${this.#icon(app.icon)}<span>${esc(app.name)}</span></div>` +
       `<div class="window-controls"><button data-action="min" title="Minimize" aria-label="Minimize">${this.#icon('min')}</button>` +
@@ -67,60 +75,33 @@ export class WindowManager {
       `<button class="close" data-action="close" title="Close" aria-label="Close">${this.#icon('close')}</button></div></header>` +
       `<div class="window-content">${html}</div>`;
     this.#layer.append(el);
+    if (position && !mobile) this.#applyRect(el, position);
 
     const proc = this.#processes.launch(id, app);
-    const entry = { el, app, proc };
+    const entry = { el, app, proc, z: 0, drag: null };
     this.#windows.set(id, entry);
     this.#bind(id, entry);
     this.focus(id);
     return entry;
   }
 
-  // Per-window listeners live in the process scope, so close() removes them.
-  #bind(id, { el, proc }) {
-    const scope = proc.scope;
-    scope.on(el, 'pointerdown', () => this.focus(id));
-    const bar = el.querySelector('.window-header');
-    scope.on(bar, 'pointerdown', e => this.#startDrag(e, id, el, bar));
-  }
-
-  #startDrag(e, id, el, bar) {
-    if (e.target.closest('button') || this.#isMobile() || el.classList.contains('maximized')) return;
-    const rect = el.getBoundingClientRect();
-    const sx = e.clientX;
-    const sy = e.clientY;
-    bar.setPointerCapture(e.pointerId);
-    const move = ev => {
-      el.style.left = Math.max(0, Math.min(innerWidth - el.offsetWidth, rect.left + ev.clientX - sx)) + 'px';
-      el.style.top = Math.max(0, Math.min(innerHeight - el.offsetHeight - 50, rect.top + ev.clientY - sy)) + 'px';
-    };
-    const end = () => {
-      bar.removeEventListener('pointermove', move);
-      bar.removeEventListener('pointerup', end);
-      bar.removeEventListener('pointercancel', end);
-      const r = el.getBoundingClientRect();
-      this.#onMoved(id, { x: r.left, y: r.top, w: r.width, h: r.height });
-    };
-    bar.addEventListener('pointermove', move);
-    bar.addEventListener('pointerup', end, { once: true });
-    bar.addEventListener('pointercancel', end, { once: true });
-  }
-
+  // Focus is cheap: the taskbar is rebuilt only when the active window changes.
   focus(id) {
     const w = this.#windows.get(id);
     if (!w) return;
     const mobile = this.#isMobile();
     const changed = this.#active !== id || w.el.classList.contains('hidden');
     for (const [key, x] of this.#windows) {
+      if (key === id) continue;
       x.el.classList.remove('focused');
-      if (mobile && key !== id) x.el.classList.add('hidden');
+      if (mobile) this.#hide(key, x);
     }
-    w.el.classList.remove('hidden');
+    this.#show(id, w);
     w.el.classList.add('focused');
-    w.el.style.zIndex = ++this.#z;
+    w.z = ++this.#z;
+    w.el.style.zIndex = w.z;
     this.#active = id;
     if (mobile) this.#mobile = id;
-    this.#processes.resume(id);
     if (changed) this.#onChange();
   }
 
@@ -131,26 +112,29 @@ export class WindowManager {
   minimize(id) {
     const w = this.#windows.get(id);
     if (!w) return;
-    w.el.classList.add('hidden');
+    this.#hide(id, w);
     if (this.#active === id) this.#active = null;
-    this.#processes.suspend(id);
-    if (this.#isMobile()) {
-      if (this.#mobile === id) this.#mobile = null;
-      this.#onMobileHome(true);
-    }
+    if (this.#mobile === id) this.#mobile = null;
+    if (this.#isMobile()) this.#onMobileHome(true);
+    else this.#focusTop();
     this.#onChange();
   }
 
+  // Removes the window and its process. On desktop the topmost visible window
+  // becomes active; on a phone the home screen is shown.
   close(id) {
     const w = this.#windows.get(id);
     if (!w) return;
     this.#windows.delete(id);
     w.el.remove();
     this.#processes.terminate(id);
-    if (this.#active === id) this.#active = [...this.#windows.keys()].at(-1) || null;
     if (this.#mobile === id) this.#mobile = null;
+    if (this.#active === id) {
+      this.#active = null;
+      if (!this.#isMobile()) this.#focusTop();
+    }
     this.#onChange();
-    if (this.#isMobile() && !this.#mobile) this.#onMobileHome(true);
+    if (this.#isMobile() && this.#mobile === null) this.#onMobileHome(true);
   }
 
   // Returns true when the window is now maximized.
@@ -165,22 +149,122 @@ export class WindowManager {
     return yes;
   }
 
-  // Hides every window and shows the mobile home screen.
   showMobileHome() {
-    for (const w of this.#windows.values()) w.el.classList.add('hidden');
+    for (const [key, w] of this.#windows) this.#hide(key, w);
     this.#active = null;
     this.#mobile = null;
     this.#onMobileHome(true);
     this.#onChange();
   }
 
-  // Re-applies single-window focus after a viewport change on phones.
   refocusMobile() {
     if (this.#mobile) this.focus(this.#mobile);
   }
 
-  // Closes every window and terminates its process.
+  // Brings every desktop window back inside the work area, e.g. after the
+  // browser window shrinks. Does not save positions.
+  reflow() {
+    if (this.#isMobile()) return;
+    for (const w of this.#windows.values()) {
+      if (!w.el.classList.contains('maximized')) this.#fit(w.el);
+    }
+  }
+
   closeAll() {
     for (const id of [...this.#windows.keys()]) this.close(id);
+  }
+
+  // Drag listeners live in a per-drag Scope. The window's own Scope disposes
+  // any drag still in progress when the window closes.
+  #bind(id, entry) {
+    const { el, proc } = entry;
+    const scope = proc.scope;
+    scope.on(el, 'pointerdown', () => this.focus(id));
+    const bar = el.querySelector('.window-header');
+    scope.on(bar, 'pointerdown', e => this.#startDrag(id, entry, e, bar));
+    scope.add(() => {
+      entry.drag?.dispose();
+      entry.drag = null;
+    });
+  }
+
+  #startDrag(id, entry, e, bar) {
+    if (e.button !== undefined && e.button !== 0) return;
+    if (e.target.closest('button') || this.#isMobile() || entry.el.classList.contains('maximized')) return;
+    entry.drag?.dispose();
+    const drag = new Scope();
+    entry.drag = drag;
+
+    const el = entry.el;
+    const rect = el.getBoundingClientRect();
+    const layerRect = this.#layer.getBoundingClientRect();
+    const sx = e.clientX;
+    const sy = e.clientY;
+    try {
+      bar.setPointerCapture(e.pointerId);
+    } catch {
+      // Capture is best effort; the listeners below still work inside the bar.
+    }
+    const move = ev => {
+      const maxX = Math.max(0, this.#layer.clientWidth - el.offsetWidth);
+      const maxY = Math.max(0, this.#layer.clientHeight - el.offsetHeight);
+      el.style.left = clamp(rect.left - layerRect.left + ev.clientX - sx, 0, maxX) + 'px';
+      el.style.top = clamp(rect.top - layerRect.top + ev.clientY - sy, 0, maxY) + 'px';
+    };
+    const end = () => {
+      if (entry.drag !== drag) return;
+      drag.dispose();
+      entry.drag = null;
+      const r = el.getBoundingClientRect();
+      this.#onMoved(id, { x: r.left - layerRect.left, y: r.top - layerRect.top, w: r.width, h: r.height });
+    };
+    drag.on(bar, 'pointermove', move).on(bar, 'pointerup', end).on(bar, 'pointercancel', end);
+  }
+
+  #hide(id, w) {
+    w.el.classList.add('hidden');
+    w.el.classList.remove('focused');
+    this.#processes.suspend(id);
+  }
+
+  #show(id, w) {
+    w.el.classList.remove('hidden');
+    this.#processes.resume(id);
+  }
+
+  // Makes the topmost visible window active, if there is one.
+  #focusTop() {
+    let best = null;
+    for (const [key, w] of this.#windows) {
+      if (w.el.classList.contains('hidden')) continue;
+      if (!best || w.z > best.z) best = { id: key, z: w.z };
+    }
+    if (best) this.focus(best.id);
+  }
+
+  // Applies a saved rectangle, limited to the current work area.
+  #applyRect(el, pos) {
+    const area = { width: this.#layer.clientWidth, height: this.#layer.clientHeight };
+    const w = finite(pos.w);
+    const h = finite(pos.h);
+    const width = w === null ? el.offsetWidth : clamp(w, Math.min(MIN_W, area.width), area.width);
+    const height = h === null ? el.offsetHeight : clamp(h, Math.min(MIN_H, area.height), area.height);
+    if (w !== null) el.style.width = width + 'px';
+    if (h !== null) el.style.height = height + 'px';
+    el.style.left = clamp(finite(pos.x) ?? 0, 0, Math.max(0, area.width - width)) + 'px';
+    el.style.top = clamp(finite(pos.y) ?? 0, 0, Math.max(0, area.height - height)) + 'px';
+  }
+
+  // Shrinks a window that is larger than the work area and moves it back on screen.
+  #fit(el) {
+    const area = { width: this.#layer.clientWidth, height: this.#layer.clientHeight };
+    const width = Math.min(el.offsetWidth, area.width);
+    const height = Math.min(el.offsetHeight, area.height);
+    const left = clamp(el.offsetLeft, 0, Math.max(0, area.width - width));
+    const top = clamp(el.offsetTop, 0, Math.max(0, area.height - height));
+    if (width !== el.offsetWidth) el.style.width = width + 'px';
+    if (height !== el.offsetHeight) el.style.height = height + 'px';
+    if (left !== el.offsetLeft) el.style.left = left + 'px';
+    if (top !== el.offsetTop) el.style.top = top + 'px';
   }
 }

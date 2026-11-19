@@ -1,8 +1,8 @@
-// LightDesk runtime: event bus, resource scopes, and an error boundary.
-// Shared by every other module. It does not touch the DOM layout itself.
+// LightDesk runtime: event bus, resource scopes, and the error boundary.
+// Shared by every other module. It does not touch window layout.
 
-// Minimal publish/subscribe bus. Handlers that throw are logged and do not
-// stop other handlers from running.
+// Minimal publish/subscribe bus. A handler that throws is logged and does not
+// stop the remaining handlers.
 export class EventBus {
   #handlers = new Map();
 
@@ -26,9 +26,9 @@ export class EventBus {
   }
 }
 
-// A Scope owns every listener, timer and cleanup callback created on behalf
-// of one process or window. dispose() removes all of them, so a closed app
-// cannot keep running or leak listeners.
+// A Scope owns the listeners, timers and cleanups created for one process or
+// window. dispose() runs all of them. Adding to a disposed scope runs the
+// cleanup immediately, so late registrations cannot leak.
 export class Scope {
   #disposers = [];
   #disposed = false;
@@ -40,15 +40,15 @@ export class Scope {
   add(disposer) {
     if (this.#disposed) {
       disposer();
-      return;
+      return this;
     }
     this.#disposers.push(disposer);
+    return this;
   }
 
   on(target, type, fn, opts) {
     target.addEventListener(type, fn, opts);
-    this.add(() => target.removeEventListener(type, fn, opts));
-    return this;
+    return this.add(() => target.removeEventListener(type, fn, opts));
   }
 
   timeout(fn, ms) {
@@ -77,8 +77,8 @@ export class Scope {
   }
 }
 
-// Central runtime object. Errors are reported on the bus so the shell can
-// show a notice instead of crashing.
+// Central runtime. Every caught error is reported on the bus, so the shell can
+// tell the user without crashing.
 export const runtime = {
   bus: new EventBus(),
 
@@ -87,7 +87,7 @@ export const runtime = {
     this.bus.emit('error', { err, source });
   },
 
-  // Runs fn and returns its value, or the fallback if it throws.
+  // Returns fn()'s value, or fallback if it throws.
   safely(source, fn, fallback = null) {
     try {
       return fn();
@@ -95,5 +95,12 @@ export const runtime = {
       this.reportError(err, source);
       return fallback;
     }
+  },
+
+  // Reports a rejected promise and returns it, so callers can still await it.
+  attach(promise, source) {
+    return promise.catch(err => {
+      this.reportError(err, source);
+    });
   },
 };
